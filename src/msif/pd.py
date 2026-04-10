@@ -1,10 +1,45 @@
-from enum import IntEnum, auto
-from typing import TYPE_CHECKING, ClassVar, Literal, Sequence, Tuple, TypeAlias, TypedDict, Union
-from typedsigrokdecode import OUTPUT_ANN, AnnotationStream, BottomDecoder, ChannelCondition, HasAnnotationRows, HasAnnotations, HasChannels, HasOptionalChannels, HasOptions, NameDescList, OptionMap
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum, IntEnum, auto
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    TypedDict,
+    Union,
+)
+from typedsigrokdecode import (
+    OUTPUT_ANN,
+    OUTPUT_PYTHON,
+    AnnotationStream,
+    BottomDecoder,
+    ChannelCondition,
+    ClassAnnotationPair,
+    HasAnnotationRows,
+    HasAnnotations,
+    HasChannels,
+    HasOptionalChannels,
+    HasOptions,
+    NameDescList,
+    OptionMap,
+    PythonStream,
+)
+from .stacked import TPC_NAMES, PacketType, TransactionPacket
+from itertools import groupby, islice, pairwise
 
 
-PythonPacket: TypeAlias = None
-StateLiteral: TypeAlias = Literal['IDLE', 'TPC', 'OUT_DATA', 'OUT_RDY', 'IN_RDY', 'IN_DATA', 'IN_DATA2']
+StateLiteral: TypeAlias = Literal[
+    "IDLE", "TPC", "OUT_DATA", "OUT_RDY", "IN_RDY", "IN_DATA"
+]
 
 
 class IdName(TypedDict):
@@ -21,19 +56,59 @@ class Channel(IntEnum):
     DATA3 = auto()
 
     def to_idname(self) -> IdName:
-        return {'id': self.name.lower(), 'name': self.name}
+        return {"id": self.name.lower(), "name": self.name}
 
 
 class Annotation(IntEnum):
-    START = 0
-    TPC = auto()
+    TPC = 0
     DATA = auto()
     DATA_RDY = auto()
     W_CRC = auto()
     W_FORMAT = auto()
+    S_START = auto()
+    S_TPC = auto()
+    S_DATA = auto()
+    S_RDY = auto()
+    S_DNC = auto()
 
     def name_as_id(self) -> str:
-        return self.name.lower().replace('_', '-')
+        return self.name.lower().replace("_", "-")
+
+
+class ModeParameter(NamedTuple):
+    delay_start: int
+    delay_bs: int
+
+
+class SymbolType(Enum):
+    START = auto()
+    TPC = auto()
+    DATA = auto()
+    RDY = auto()
+    RDY_WAIT = auto()
+    DELAY = auto()
+
+
+@dataclass
+class TransactionSymbol:
+    samplenum: int
+    shift: int
+    type_: SymbolType
+
+    def as_annotation_data(self) -> Optional[ClassAnnotationPair]:
+        if self.type_ == SymbolType.START:
+            return (Annotation.S_START, ["Start", "S"])
+        elif self.type_ == SymbolType.TPC:
+            return (Annotation.S_TPC, [f"{self.shift:1X}"])
+        elif self.type_ == SymbolType.DATA:
+            return (Annotation.S_DATA, [f"{self.shift:1X}"])
+        elif self.type_ == SymbolType.RDY or self.type_ == SymbolType.RDY_WAIT:
+            return (
+                Annotation.S_RDY,
+                ["RDY", "R"] if self.shift == 0 else ["!RDY", "!R", "!"],
+            )
+        elif self.type_ == SymbolType.DELAY:
+            return (Annotation.S_DNC, ["Delay", "DNC", "X"])
 
 
 CRC_TAB = (
@@ -72,6 +147,15 @@ CRC_TAB = (
 )
 
 
+T = TypeVar("T")
+
+
+def tail(n: int, iterable: Iterable[T]) -> Iterable[T]:
+    "Return an iterator over the last n items."
+    # tail(3, 'ABCDEFG') → E F G
+    return iter(deque(iterable, maxlen=n))
+
+
 def format_annotations(inp: Sequence[Tuple[Annotation, str]]) -> NameDescList:
     return tuple((idx.name_as_id(), desc) for idx, desc in inp)
 
@@ -80,329 +164,511 @@ def crc16(data: memoryview) -> int:
     crc = 0
 
     for b in data:
-        crc = ((crc << 8) ^ CRC_TAB[b ^ (crc >> 8)]) & 0xffff
-    
+        crc = ((crc << 8) ^ CRC_TAB[b ^ (crc >> 8)]) & 0xFFFF
+
     return crc
 
 
-class Decoder(BottomDecoder[PythonPacket], HasOptions, HasChannels, HasOptionalChannels, HasAnnotations, HasAnnotationRows):
+class Decoder(
+    BottomDecoder[PacketType],
+    HasOptions,
+    HasChannels,
+    HasOptionalChannels,
+    HasAnnotations,
+    HasAnnotationRows,
+):
     api_version = 3
-    id = 'msif'
-    name = 'MSIF'
-    longname = 'Memory Stick Interface'
-    desc = 'Annotate the data transmission of Memory Stick'
-    license = 'gplv3+'
-    inputs = ['logic']
-    outputs = []
-    tags = ['Memory']
+    id = "msif"
+    name = "MSIF"
+    longname = "Memory Stick Interface"
+    desc = "Memory Stick Interface link layer protocol."
+    license = "gplv3+"
+    inputs = ["logic"]
+    outputs = ["msif"]
+    tags = ["Memory"]
     options = (
         {
-            'id': 'bus-width',
-            'desc': 'Bus width',
-            'default': 'auto',
-            'values': ('auto', '1-bit', '4-bit'),
+            "id": "bus-width",
+            "desc": "Bus width",
+            "default": "auto",
+            "values": ("auto", "1-bit", "4-bit"),
         },
     )
     # These must be in the exact same order as the IntEnum
     channels = (
-        {**Channel.SDIO.to_idname(), 'desc': 'Data line 0'},
-        {**Channel.SCLK.to_idname(), 'desc': 'Clock line'},
-        {**Channel.BS.to_idname(), 'desc': 'Bus state'},
+        {**Channel.SDIO.to_idname(), "desc": "Data line 0"},
+        {**Channel.SCLK.to_idname(), "desc": "Clock line"},
+        {**Channel.BS.to_idname(), "desc": "Bus state"},
     )
     optional_channels = (
-        {**Channel.DATA1.to_idname(), 'desc': 'Data line 1'},
-        {**Channel.DATA2.to_idname(), 'desc': 'Data line 2'},
-        {**Channel.DATA3.to_idname(), 'desc': 'Data line 3'},
+        {**Channel.DATA1.to_idname(), "desc": "Data line 1"},
+        {**Channel.DATA2.to_idname(), "desc": "Data line 2"},
+        {**Channel.DATA3.to_idname(), "desc": "Data line 3"},
     )
-    annotations = format_annotations([
-        (Annotation.START, 'Start Condition'),
-        (Annotation.TPC, 'Transfer Protocol Command'),
-        (Annotation.DATA, 'Data'),
-        (Annotation.DATA_RDY, 'Data Ready'),
-        (Annotation.W_CRC, 'CRC Error'),
-        (Annotation.W_FORMAT, 'Invalid data format'),
-    ])
+    annotations = format_annotations(
+        [
+            (Annotation.TPC, "Transfer Protocol Command"),
+            (Annotation.DATA, "Data"),
+            (Annotation.DATA_RDY, "Data Ready"),
+            (Annotation.W_CRC, "CRC Error"),
+            (Annotation.W_FORMAT, "Invalid Data Format"),
+            (Annotation.S_START, "Start"),
+            (Annotation.S_TPC, "TPC Symbol"),
+            (Annotation.S_DATA, "Data Symbol"),
+            (Annotation.S_RDY, "Ready"),
+            (Annotation.S_DNC, "Do Not Care"),
+        ]
+    )
     annotation_rows = (
-        ('symbols', 'Protocol Symbols', (
-            Annotation.START,
-            Annotation.TPC,
-            Annotation.DATA,
-            Annotation.DATA_RDY,
-        )),
-        ('warnings', 'Warnings', (
-            Annotation.W_CRC,
-            Annotation.W_FORMAT,
-        ))
+        (
+            "symbols",
+            "Symbols",
+            (
+                Annotation.S_START,
+                Annotation.S_TPC,
+                Annotation.S_DATA,
+                Annotation.S_RDY,
+                Annotation.S_DNC,
+            ),
+        ),
+        (
+            "fields",
+            "Fields",
+            (
+                Annotation.TPC,
+                Annotation.DATA,
+                Annotation.DATA_RDY,
+            ),
+        ),
+        (
+            "warnings",
+            "Warnings",
+            (
+                Annotation.W_CRC,
+                Annotation.W_FORMAT,
+            ),
+        ),
     )
 
-    SCLK_POSEDGE: ClassVar[ChannelCondition] = {Channel.SCLK: 'r'}
+    SCLK_POSEDGE: ClassVar[ChannelCondition] = {Channel.SCLK: "r"}
+    MODES: ClassVar[Dict[Literal[1, 4], ModeParameter]] = {
+        1: ModeParameter(1, 1),
+        4: ModeParameter(4, 2),
+    }
 
     out_ann: AnnotationStream
+    out_python: PythonStream
 
-    state: StateLiteral = 'IDLE'
     bits: Literal[1, 4] = 1
     allow_mode_switch: bool = False
+    mode_switch_reg: Optional[bytes] = None
+    mode_switch_val: Optional[bytes] = None
+
+    state: StateLiteral
+    next_state: StateLiteral
+    bs: int
+    delay_counter: int
+    txn_buffer: List[TransactionSymbol]
+    _txn_is_out: Optional[bool]
+
+    def __init__(self):
+        super().__init__()
+        self.reset()
 
     def start(self) -> None:
         self.out_ann = self.register(OUTPUT_ANN)
+        self.out_python = self.register(OUTPUT_PYTHON)
 
         options: OptionMap = self.get_options()
 
-        if options['bus-width'] == 'auto':
+        if options["bus-width"] == "auto":
             self.allow_mode_switch = True
-        elif options['bus-width'] == '4-bit':
+        elif options["bus-width"] == "4-bit":
             self.bits = 4
 
-    def handle_bit_switch(self, regs: bytes, val: bytes) -> bool:
-        if not self.allow_mode_switch:
+    def handle_mode_switch(self, packet: Optional[TransactionPacket]) -> bool:
+        if not self.allow_mode_switch or packet is None:
             return False
 
-        wbase, wsize = regs[2], regs[3]
+        if packet.tpc == 0b1000:
+            self.mode_switch_reg = packet.data
+            self.mode_switch_val = None
+            return False
+
+        if self.mode_switch_reg is not None and packet.tpc == 0b1011:
+            self.mode_switch_val = packet.data
+
+        if self.mode_switch_reg is None or self.mode_switch_val is None:
+            self.mode_switch_reg = None
+            self.mode_switch_val = None
+            return False
+
+        wbase, wsize = self.mode_switch_reg[2], self.mode_switch_reg[3]
         if wbase == 0 and wsize == 0:
+            self.mode_switch_reg = None
+            self.mode_switch_val = None
             return False
         wend = wbase + wsize
         if wbase <= 0x10 < wend:
             val_offset = 0x10 - wbase
-            if val_offset >= len(val):
+            if val_offset >= len(self.mode_switch_val):
+                self.mode_switch_reg = None
+                self.mode_switch_val = None
                 return False
-            cfg = val[val_offset]
-            if cfg & 0x80:
-                self.bits = 1
-            else:
+            cfg = self.mode_switch_val[val_offset]
+            # TODO: MS classic seems to expect 0x88 before switching to 20MHz 4-bit mode.
+            if cfg == 0x88:
+                print("Switch to 4-bit mode (classic)")
                 self.bits = 4
+            elif cfg & 0x80:
+                print("Switch to 1-bit mode")
+                self.bits = 1
+            elif not cfg & 0x80:
+                print("Switch to 4-bit mode (pro)")
+                self.bits = 4
+            else:
+                print(f"Unknown cfg write {cfg}")
+            self.mode_switch_reg = None
+            self.mode_switch_val = None
             return True
+
+        self.mode_switch_reg = None
+        self.mode_switch_val = None
         return False
 
-    def put_data(self, start: int, end: int, dir_: Literal['IN', 'OUT'], data: Union[bytes, bytearray]):
+    def put_data(
+        self,
+        start: int,
+        end: int,
+        dir_: Literal["IN", "OUT"],
+        data: Union[bytes, bytearray],
+    ) -> Tuple[int, bool]:
         if len(data) < 3:
-            self.put(start, end, self.out_ann, (Annotation.W_FORMAT, ['Data too short.']))
-            return
+            self.put(
+                start, end, self.out_ann, (Annotation.W_FORMAT, ["Data too short."])
+            )
+            return -1, False
         payload = memoryview(data)[:-2]
         crc_expected = (data[-2] << 8) | data[-1]
         crc_actual = crc16(payload)
-        crc_ok = 'OK' if crc_expected == crc_actual else 'NG'
-        self.put(start, end, self.out_ann, (Annotation.DATA, [f'{dir_}: {payload.hex()} CRC: {crc_expected:04x} ({crc_ok})', dir_, dir_[0]]))
-        if crc_ok != 'OK':
-            self.put(start, end, self.out_ann, (Annotation.W_CRC, [f'CRC mismatch (exp.: {crc_expected:04x} got: {crc_actual:04x})']))
+        crc_ok = "OK" if crc_expected == crc_actual else "NG"
 
-    def decode4(self) -> bool:
-        next_state: StateLiteral = 'IDLE'
-        shift: int = 0
-        data: bytearray = bytearray()
-        data_count: int = 0
-        ann_start: int = 0
-        seen_rdy: bool = False
-        tpc: int = 0
+        with_hex = []
+        payload_str = " ".join(f"{b:02X}" for b in payload)
+        with_hex.append(f"{dir_} [ {payload_str} ] CRC: {crc_expected:04X} ({crc_ok})")
+        for l in range(64, 7, -8):
+            if len(payload) > l:
+                payload_str_short = " ".join(f"{b:02X}" for b in payload[:l])
+                with_hex.append(
+                    f"{dir_} [ {payload_str_short} ... ] CRC: {crc_expected:04X} ({crc_ok})"
+                )
 
-        regs: bytes = b'\x00\x00\x00\x00'
-        val: bytes = b''
+        self.put(
+            start,
+            end,
+            self.out_ann,
+            (Annotation.DATA, [*with_hex, f"{dir_} CRC: {crc_ok}", dir_, dir_[0]]),
+        )
 
-        pulse_count = 0
-
-        while True:
-            prev_pulse = self.samplenum
-            latched = self.wait(self.SCLK_POSEDGE)
-            if latched is None:
-                return False
-            curr_pulse = self.samplenum
-
-            # Finish off state changes
-            if self.state != next_state:
-                if self.state == 'IDLE':
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.START, ['Start Condition', 'Start', 'S']))
-                elif self.state == 'TPC':
-                    tpc = shift >> 12
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.TPC, [f'TPC: {tpc:04b}', 'TPC', 'T']))
-                elif self.state == 'OUT_DATA':
-                    self.put_data(ann_start, curr_pulse, 'OUT', data)
-                elif self.state == 'IN_RDY':
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.DATA_RDY, ['RDY', 'R']))
-                elif self.state == 'OUT_RDY':
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.DATA_RDY, ['ACK', 'A']))
-                    # Bit mode switch hook
-                    if tpc == 0b1000:
-                        regs = bytes(data[:4])
-                    elif tpc == 0b1011:
-                        val = bytes(data[:-2])
-                        if self.handle_bit_switch(regs, val):
-                            return True
-                    else:
-                        regs = b'\x00\x00\x00\x00'
-                        val = b''
-                if self.state != 'IN_DATA':
-                    ann_start = curr_pulse
-                self.state = next_state
-
-            shift <<= 4
-            shift &= 0xffff
-            shift |= (
-                (latched[Channel.DATA3] << 3) |
-                (latched[Channel.DATA2] << 2) |
-                (latched[Channel.DATA1] << 1) |
-                latched[Channel.SDIO]
+        if crc_ok != "OK":
+            self.put(
+                start,
+                end,
+                self.out_ann,
+                (
+                    Annotation.W_CRC,
+                    [f"CRC mismatch (exp.: {crc_expected:04X} got: {crc_actual:04X})"],
+                ),
             )
-
-            if self.state == 'IDLE' and latched[Channel.BS] == 1:
-                if pulse_count == 0:
-                    ann_start = curr_pulse
-                pulse_count += 1
-                if pulse_count == 4:
-                    next_state = 'TPC'
-                    pulse_count = 0
-            elif self.state == 'TPC' and latched[Channel.BS] == 0:
-                pulse_count += 1
-                if pulse_count == 2:
-                    if shift & 0x8000:
-                        next_state = 'OUT_DATA'
-                    else:
-                        next_state = 'IN_RDY'
-                    data_count = 0
-                    data.clear()
-                    seen_rdy = False
-                    pulse_count = 0
-            elif self.state == 'OUT_DATA':
-                if pulse_count == 0:
-                    data_count += 4
-                    if data_count % 8 == 0:
-                        data.append(shift & 0xff)
-                if latched[Channel.BS] == 1:
-                    pulse_count += 1
-                    if pulse_count == 4:
-                        next_state = 'OUT_RDY'
-                        pulse_count = 0
-            elif self.state == 'IN_RDY':
-                if not seen_rdy and not shift & 1:
-                    seen_rdy = True
-                    ann_start = curr_pulse
-                if latched[Channel.BS] == 1:
-                    pulse_count += 1
-                    if pulse_count == 2:
-                        next_state = 'IN_DATA'
-                        pulse_count = 0
-            elif self.state == 'OUT_RDY':
-                if not seen_rdy and not shift & 1:
-                    seen_rdy = True
-                    ann_start = curr_pulse
-                if latched[Channel.BS] == 0:
-                    pulse_count += 1
-                    if pulse_count == 2:
-                        next_state = 'IDLE'
-                        pulse_count = 0
-            elif self.state == 'IN_DATA' or self.state == 'IN_DATA2':
-                # Commit data on the second clock since no other clock exists
-                data_count += 4
-                if data_count % 8 == 0:
-                    data.append(shift & 0xff)
-                if latched[Channel.BS] == 0:
-                    next_state = 'IN_DATA2' if self.state == 'IN_DATA' else 'IDLE'
-                    if next_state == 'IDLE':
-                        self.put_data(ann_start, curr_pulse, 'IN', data)
-
-    def decode1(self) -> bool:
-        '''
-        1-bit mode decoder.
-        '''
-        next_state: StateLiteral = 'IDLE'
-        shift: int = 0
-        data: bytearray = bytearray()
-        data_count: int = 0
-        ann_start: int = 0
-        seen_rdy: bool = False
-        tpc: int = 0
-
-        regs: bytes = b'\x00\x00\x00\x00'
-        val: bytes = b''
-
-        while True:
-            prev_pulse = self.samplenum
-            latched = self.wait(self.SCLK_POSEDGE)
-            if latched is None:
-                return False
-            curr_pulse = self.samplenum
-
-            # Finish off state changes
-            if self.state != next_state:
-                if self.state == 'IDLE':
-                    self.put(prev_pulse, curr_pulse, self.out_ann, (Annotation.START, ['Start Condition', 'Start', 'S']))
-                elif self.state == 'TPC':
-                    tpc = shift >> 4
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.TPC, [f'TPC: {tpc:04b}', 'TPC', 'T']))
-                elif self.state == 'OUT_DATA':
-                    self.put_data(ann_start, curr_pulse, 'OUT', data)
-                elif self.state == 'IN_RDY':
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.DATA_RDY, ['RDY', 'R']))
-                elif self.state == 'OUT_RDY':
-                    self.put(ann_start, curr_pulse, self.out_ann, (Annotation.DATA_RDY, ['ACK', 'A']))
-                    # Bit mode switch hook
-                    if tpc == 0b1000:
-                        regs = bytes(data[:4])
-                    elif tpc == 0b1011:
-                        val = bytes(data[:-2])
-                        if self.handle_bit_switch(regs, val):
-                            return True
-                    else:
-                        regs = b'\x00\x00\x00\x00'
-                        val = b''
-                elif self.state == 'IN_DATA':
-                    self.put_data(ann_start, curr_pulse, 'IN', data)
-                ann_start = curr_pulse
-                self.state = next_state
-
-            shift <<= 1
-            shift &= 0xff
-            shift |= latched[Channel.SDIO]
-
-            # State transitions
-            if self.state == 'IDLE' and latched[Channel.BS] == 1:
-                next_state = 'TPC'
-            elif self.state == 'TPC' and latched[Channel.BS] == 0:
-                if shift & 0x80:
-                    next_state = 'OUT_DATA'
-                else:
-                    next_state = 'IN_RDY'
-                data_count = 0
-                data.clear()
-                seen_rdy = False
-            elif self.state == 'OUT_DATA':
-                data_count += 1
-                if data_count % 8 == 0:
-                    data.append(shift)
-                if latched[Channel.BS] == 1:
-                    next_state = 'OUT_RDY'
-            elif self.state == 'IN_RDY':
-                if not seen_rdy and not shift & 1:
-                    seen_rdy = True
-                    ann_start = curr_pulse
-                if latched[Channel.BS] == 1:
-                    next_state = 'IN_DATA'
-            elif self.state == 'OUT_RDY':
-                if not seen_rdy and not shift & 1:
-                    seen_rdy = True
-                    ann_start = curr_pulse
-                if latched[Channel.BS] == 0:
-                    next_state = 'IDLE'
-            elif self.state == 'IN_DATA':
-                data_count += 1
-                if data_count % 8 == 0:
-                    data.append(shift)
-                if latched[Channel.BS] == 0:
-                    next_state = 'IDLE'
+            return crc_expected, False
+        return crc_expected, True
 
     def decode(self, /) -> None:
         while True:
-            if self.bits == 1:
-                if not self.decode1():
-                    break
-            elif self.bits == 4:
-                if not self.decode4():
+            latched = self.wait(self.SCLK_POSEDGE)
+            if latched is None:
+                return
+
+            mode = self.MODES[self.bits]
+            sdio, _, bs, data1, data2, data3 = latched
+            bits = self.bits
+            state = self.state
+            shift = 0
+            flip = self.txn_bs_flip(bs)
+
+            if bits == 4 and (data1 == 0xff or data2 == 0xff or data3 == 0xff):
+                raise RuntimeError('Decoder is in 4-bit mode but required inputs are not available.')
+
+            if bits == 1:
+                shift = sdio
+            elif bits == 4:
+                shift = (data3 << 3) | (data2 << 2) | (data1 << 1) | sdio
+
+            symbol_type: Optional[SymbolType] = None
+            if state == "IDLE" and bs == 1:
+                symbol_type = SymbolType.START
+                if flip:
+                    self.txn_transition("TPC", mode.delay_start)
+            elif state == "TPC":
+                symbol_type = SymbolType.TPC
+                if flip:
+                    is_out = self.txn_is_out()
+                    if is_out is None:
+                        # TODO report error
+                        self.txn_finish()
+                        continue
+                    elif is_out:
+                        self.txn_transition("OUT_DATA", mode.delay_bs)
+                    else:
+                        self.txn_transition("IN_RDY", mode.delay_bs)
+            elif state == "OUT_DATA":
+                symbol_type = SymbolType.DATA
+                if flip:
+                    self.txn_transition("OUT_RDY", mode.delay_bs)
+            elif state == "IN_RDY":
+                symbol_type = SymbolType.RDY
+                if flip:
+                    self.txn_transition("IN_DATA", mode.delay_bs)
+            elif state == "OUT_RDY":
+                symbol_type = SymbolType.RDY
+                if flip:
+                    self.txn_transition("IDLE", mode.delay_bs)
+            elif state == "IN_DATA":
+                symbol_type = SymbolType.DATA
+                if flip:
+                    self.txn_transition("IDLE", mode.delay_bs)
+
+            if symbol_type is None and bs == 0:
+                continue
+
+            assert symbol_type is not None
+
+            self.txn_buffer.append(
+                TransactionSymbol(self.samplenum, shift, symbol_type)
+            )
+            self.txn_handle_transition()
+
+    def txn_finish(self):
+        """
+        Process the transaction buffer, pass it around and clear the
+        transaction state.
+        """
+        self.txn_post_proc()
+        packet = self.txn_annotate()
+        self.handle_mode_switch(packet)
+        self.txn_reset()
+
+    def txn_post_proc(self):
+        """
+        Post-process the transaction buffer.
+
+        This helper exists because it's a PITA to insert those specific delays
+        using the state machine alone, and the code became unmanagable.
+        """
+        if self.bits == 4:
+            # Only the first 2 symbols of the TPC are real
+            for sym in islice(
+                (s for s in self.txn_buffer if s.type_ == SymbolType.TPC), 2, None
+            ):
+                sym.type_ = SymbolType.DELAY
+            # The last 2 data symbols of an out transaction are actually delays
+            if self.txn_is_out():
+                for sym in tail(
+                    2, (s for s in self.txn_buffer if s.type_ == SymbolType.DATA)
+                ):
+                    sym.type_ = SymbolType.DELAY
+        for sym in self.txn_buffer:
+            if sym.type_ == SymbolType.RDY:
+                if sym.shift & 1:
+                    sym.type_ = SymbolType.RDY_WAIT
+                else:
                     break
 
+    def txn_annotate(self) -> Optional[TransactionPacket]:
+        if len(self.txn_buffer) == 0:
+            return None
+
+        packet: Optional[TransactionPacket] = None
+
+        timestamps = list(
+            (sym0.samplenum, sym1.samplenum) for sym0, sym1 in pairwise(self.txn_buffer)
+        )
+        # Assume the last SCLK pulse is the same as the one that came before it.
+        previous_pulse_duration = timestamps[-1][1] - timestamps[-1][0]
+        last_timestamp = self.txn_buffer[-1].samplenum
+        timestamps.append((last_timestamp, last_timestamp + previous_pulse_duration))
+
+        txn_start = timestamps[0][0]
+        txn_end = timestamps[-1][1]
+
+        index = {
+            k: list(v)
+            for k, v in groupby(
+                zip(timestamps, self.txn_buffer), key=lambda p: p[1].type_
+            )
+        }
+
+        for (ss, es), sym in zip(timestamps, self.txn_buffer):
+            ad = sym.as_annotation_data()
+            if ad is not None:
+                self.put(ss, es, self.out_ann, ad)
+
+        if SymbolType.TPC not in index:
+            self.put(
+                txn_start,
+                txn_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["State machine error: Missing TPC field."]),
+            )
+            return None
+
+        syms_tpc = index[SymbolType.TPC]
+        tpcb = 0
+        tpc_start = syms_tpc[0][0][0]
+        tpc_end = syms_tpc[-1][0][1]
+        if len(syms_tpc) * self.bits != 8:
+            self.put(
+                tpc_start,
+                tpc_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["TPC length is not 8-bit."]),
+            )
+
+        for _, sym in syms_tpc:
+            tpcb <<= self.bits
+            tpcb |= sym.shift
+
+        tpc = tpcb >> 4
+
+        if (tpcb >> 4) ^ (tpcb & 0b1111) != 0b1111:
+            self.put(
+                tpc_start,
+                tpc_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["Invalid TPC."]),
+            )
+        else:
+            self.put(
+                tpc_start,
+                tpc_end,
+                self.out_ann,
+                (
+                    Annotation.TPC,
+                    [f"{TPC_NAMES.get(tpc, 'Unknown')} ({tpc:04b})", f"{tpc:04b}", "T"],
+                ),
+            )
+
+        if SymbolType.DATA not in index:
+            self.put(
+                txn_start,
+                txn_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["State machine error: Missing DATA field."]),
+            )
+            return None
+
+        syms_data = index[SymbolType.DATA]
+        data_start = syms_data[0][0][0]
+        data_end = syms_data[-1][0][1]
+        data_size_bytes, align = divmod(len(syms_data), 8 // self.bits)
+        if align == 0:
+            data_shift = 0
+            for _, sym in syms_data:
+                data_shift <<= self.bits
+                data_shift |= sym.shift
+            data = data_shift.to_bytes(data_size_bytes, "big")
+            crc, crc_ok = self.put_data(
+                data_start, data_end, ("OUT" if self.txn_is_out() else "IN"), data
+            )
+            packet = TransactionPacket(tpc, data[:-2], crc, crc_ok)
+            self.put(
+                timestamps[0][0], timestamps[-1][1], self.out_python, ("txn", packet)
+            )
+        else:
+            self.put(
+                data_start,
+                data_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["Data is not byte-aligned."]),
+            )
+
+        if SymbolType.RDY not in index:
+            self.put(
+                txn_start,
+                txn_end,
+                self.out_ann,
+                (Annotation.W_FORMAT, ["State machine error: Missing RDY field."]),
+            )
+            return None
+
+        syms_rdy = index[SymbolType.RDY]
+        rdy_start = syms_rdy[0][0][0]
+        rdy_end = syms_rdy[-1][0][1]
+        self.put(
+            rdy_start,
+            rdy_end,
+            self.out_ann,
+            (Annotation.DATA_RDY, ["ACK", "A"] if self.txn_is_out() else ["RDY", "R"]),
+        )
+
+        return packet
+
+    def txn_transition(self, next_state: StateLiteral, cycles: int = 0) -> None:
+        if next_state != self.next_state:
+            self.delay_counter = max(cycles - 1, 0)
+            self.next_state = next_state
+
+    def txn_handle_transition(self):
+        if self.delay_counter == 0:
+            self.state = self.next_state
+            if self.next_state == "IDLE":
+                self.txn_finish()
+        else:
+            self.delay_counter -= 1
+
+    def txn_transition_pending(self) -> bool:
+        return self.state != self.next_state
+
+    def txn_bs_flip(self, bs: int) -> bool:
+        result = self.bs != bs
+        self.bs = bs
+        return result
+
+    def txn_is_out(self) -> Optional[bool]:
+        if self._txn_is_out is not None:
+            return self._txn_is_out
+
+        first_symbol = next(
+            (s for s in self.txn_buffer if s.type_ == SymbolType.TPC), None
+        )
+        if first_symbol is None:
+            return None
+
+        assert self.bits in (1, 4)
+
+        if self.bits == 1:
+            self._txn_is_out = bool(first_symbol.shift)
+        elif self.bits == 4:
+            self._txn_is_out = bool(first_symbol.shift & 0x8)
+
+        return self._txn_is_out
+
+    def txn_reset(self):
+        self.state = self.next_state = "IDLE"
+        self.bs = 0
+        self.delay_counter = 0
+        self.txn_buffer = []
+        self._txn_is_out = None
+
     def reset(self) -> None:
-        self.state = 'IDLE'
         self.bits = 1
         self.allow_mode_switch = False
+        self.mode_switch_reg = b"\x00\x00\x00\x00"
+        self.mode_switch_val = b""
+        self.txn_reset()
 
 
 if TYPE_CHECKING:
     from typing import reveal_type
+
     reveal_type(Decoder())

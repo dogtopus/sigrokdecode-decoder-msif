@@ -1,7 +1,7 @@
 [project]
-name = "msif"
+name = "sigrokdecode-decoder-msif"
 version = "0.1.0"
-description = ""
+description = "Memory Stick Interface link layer protocol decoder."
 authors = [
     {name = "dogtopus",email = "dogtopus@users.noreply.github.com"}
 ]
