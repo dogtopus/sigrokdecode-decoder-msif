@@ -4,10 +4,11 @@ from enum import Enum, IntEnum, auto
 from typing import (
     TYPE_CHECKING,
     ClassVar,
-    Dict,
+    Final,
     Iterable,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -33,7 +34,7 @@ from typedsigrokdecode import (
     OptionMap,
     PythonStream,
 )
-from .stacked import TPC_NAMES, PacketType, TransactionPacket
+from .stacked import TPC_NAMES, PacketType, RegisterCommon, Tpc, TransactionPacket
 from itertools import groupby, islice, pairwise
 
 
@@ -65,6 +66,7 @@ class Annotation(IntEnum):
     DATA_RDY = auto()
     W_CRC = auto()
     W_FORMAT = auto()
+    W_GLITCH = auto()
     S_START = auto()
     S_TPC = auto()
     S_DATA = auto()
@@ -111,7 +113,7 @@ class TransactionSymbol:
             return (Annotation.S_DNC, ["Delay", "DNC", "X"])
 
 
-CRC_TAB = (
+CRC_TAB: Final[Sequence[int]] = (
     0x0000, 0x8005, 0x800f, 0x000a, 0x801b, 0x001e, 0x0014, 0x8011,
     0x8033, 0x0036, 0x003c, 0x8039, 0x0028, 0x802d, 0x8027, 0x0022,
     0x8063, 0x0066, 0x006c, 0x8069, 0x0078, 0x807d, 0x8077, 0x0072,
@@ -145,6 +147,16 @@ CRC_TAB = (
     0x0220, 0x8225, 0x822f, 0x022a, 0x823b, 0x023e, 0x0234, 0x8231,
     0x8213, 0x0216, 0x021c, 0x8219, 0x0208, 0x820d, 0x8207, 0x0202,
 )
+
+
+BS_STATE: Final[Mapping[StateLiteral, int]] = {
+    'IDLE': 0,
+    'TPC': 1,
+    'OUT_DATA': 2,
+    'OUT_RDY': 3,
+    'IN_RDY': 2,
+    'IN_DATA': 3,
+}
 
 
 T = TypeVar("T")
@@ -185,7 +197,7 @@ class Decoder(
     license = "gplv3+"
     inputs = ["logic"]
     outputs = ["msif"]
-    tags = ["Memory"]
+    tags = ["Embedded/industrial", "Memory"]
     options = (
         {
             "id": "bus-width",
@@ -212,6 +224,7 @@ class Decoder(
             (Annotation.DATA_RDY, "Data Ready"),
             (Annotation.W_CRC, "CRC Error"),
             (Annotation.W_FORMAT, "Invalid Data Format"),
+            (Annotation.W_GLITCH, "Possible Glitch"),
             (Annotation.S_START, "Start"),
             (Annotation.S_TPC, "TPC Symbol"),
             (Annotation.S_DATA, "Data Symbol"),
@@ -246,12 +259,13 @@ class Decoder(
             (
                 Annotation.W_CRC,
                 Annotation.W_FORMAT,
+                Annotation.W_GLITCH,
             ),
         ),
     )
 
     SCLK_POSEDGE: ClassVar[ChannelCondition] = {Channel.SCLK: "r"}
-    MODES: ClassVar[Dict[Literal[1, 4], ModeParameter]] = {
+    MODES: ClassVar[Mapping[Literal[1, 4], ModeParameter]] = {
         1: ModeParameter(1, 1),
         4: ModeParameter(4, 2),
     }
@@ -267,6 +281,13 @@ class Decoder(
     state: StateLiteral
     next_state: StateLiteral
     bs: int
+    '''
+    Bus state generated from the BS pin. Contains a single integer that maps
+    to BS0-BS3. Note that this is different than the actual receiver state
+    BS0-BS3 which is represented by the self.state state instance variable,
+    as self.bs will change instantly when BS gets toggled. This variable may
+    also roll backwards if a glitch is detected on the BS line.
+    '''
     delay_counter: int
     txn_buffer: List[TransactionSymbol]
     _txn_is_out: Optional[bool]
@@ -290,12 +311,12 @@ class Decoder(
         if not self.allow_mode_switch or packet is None:
             return False
 
-        if packet.tpc == 0b1000:
+        if packet.tpc == Tpc.SET_REGS_WINDOW:
             self.mode_switch_reg = packet.data
             self.mode_switch_val = None
             return False
 
-        if self.mode_switch_reg is not None and packet.tpc == 0b1011:
+        if self.mode_switch_reg is not None and packet.tpc == Tpc.REGS_WRITE:
             self.mode_switch_val = packet.data
 
         if self.mode_switch_reg is None or self.mode_switch_val is None:
@@ -309,8 +330,8 @@ class Decoder(
             self.mode_switch_val = None
             return False
         wend = wbase + wsize
-        if wbase <= 0x10 < wend:
-            val_offset = 0x10 - wbase
+        if wbase <= RegisterCommon.CFG < wend:
+            val_offset = RegisterCommon.CFG - wbase
             if val_offset >= len(self.mode_switch_val):
                 self.mode_switch_reg = None
                 self.mode_switch_val = None
@@ -619,6 +640,29 @@ class Decoder(
             self.next_state = next_state
 
     def txn_handle_transition(self):
+        if self.state != self.next_state and self.bs != BS_STATE[self.next_state]:
+            if len(self.txn_buffer) >= 2:
+                error_offset = self.txn_buffer[-2].samplenum, self.txn_buffer[-1].samplenum
+            else:
+                error_offset = self.samplenum, self.samplenum + 1
+
+            self.put(
+                error_offset[0],
+                error_offset[1],
+                self.out_ann,
+                (
+                    Annotation.W_GLITCH,
+                    [
+                        'BS line toggled during delay, causing a delay to be canceled. Check your capture setup.',
+                        'BS',
+                    ]
+                )
+            )
+            self.next_state = self.state
+            self.delay_counter = 0
+            self.bs = (self.bs - 2) & 0x3
+            return
+
         if self.delay_counter == 0:
             self.state = self.next_state
             if self.next_state == "IDLE":
@@ -630,8 +674,9 @@ class Decoder(
         return self.state != self.next_state
 
     def txn_bs_flip(self, bs: int) -> bool:
-        result = self.bs != bs
-        self.bs = bs
+        result = (self.bs & 1) != bs
+        if result:
+            self.bs = (self.bs + 1) & 0x3
         return result
 
     def txn_is_out(self) -> Optional[bool]:

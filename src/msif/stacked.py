@@ -1,5 +1,5 @@
 from typing import NamedTuple, Literal, Tuple, TypeAlias
-from enum import IntEnum
+from enum import IntEnum, auto
 
 
 class Tpc(IntEnum):
@@ -20,6 +20,18 @@ class Tpc(IntEnum):
 
 TPC_NAMES = {v.value: v.name for v in Tpc}
 'Quick look-up of TPC names based on the 4-bit code.'
+
+
+class RegisterCommon(IntEnum):
+    INT = 0x01
+    STA0 = auto()
+    STA1 = auto()
+    TYPE = auto()
+
+    CATEGORY = 0x06
+    CLASS = auto()
+
+    CFG = 0x10
 
 
 class TransactionPacket(NamedTuple):
