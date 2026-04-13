@@ -629,7 +629,7 @@ class Decoder(
             rdy_start,
             rdy_end,
             self.out_ann,
-            (Annotation.DATA_RDY, ["ACK", "A"] if self.txn_is_out() else ["RDY", "R"]),
+            (Annotation.DATA_RDY, ["RDY", "R"]),
         )
 
         return packet
