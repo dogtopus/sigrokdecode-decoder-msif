@@ -65,11 +65,12 @@ class Command(IntEnum):
     STOP = 0x25
     TRIM = 0x26
     # PS VITA memory card auth commands - not sure how they would work exactly
+    # Could be SET_CMD followed by {READ,WRITE}_SHORT_DATA?
     # https://wiki.henkaku.xyz/vita/Memory_Card
-    VITA_AUTH0_SEED = 0x48  # PSK-based mutual auth - set seed / challenge
-    VITA_AUTH0_RESP = 0x49  # PSK-based mutual auth - get card response
-    VITA_AUTH0_UNLOCK = 0x4a  # PSK-based mutual auth - set host response and unlock the card
-    VITA_AUTH1 = 0x4b  # PKI-based device attestation
+    VITA_AUTH_SEED = 0x48  # Mutual auth - set seed / card challenge
+    VITA_AUTH_RESP = 0x49  # Mutual auth - get card response + host challenge
+    VITA_AUTH_UNLOCK = 0x4a  # Mutual auth - set host response and unlock the card
+    VITA_READ_CERT = 0x4b  # Read card certificate (constant but different across cards)
 
 
 # This is a common register but the meaning differs across different device
