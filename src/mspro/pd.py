@@ -58,9 +58,9 @@ class AccessType(IntEnum):
 
 class Command(IntEnum):
     FORMAT = 0x10
+    SLEEP = 0x11  # Another way to initiate deep sleep?
     READ = 0x20
     WRITE = 0x21
-    SLEEP = 0x23
     ATTR = 0x24
     STOP = 0x25
     TRIM = 0x26
